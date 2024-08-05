@@ -6,10 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
-	"golang.org/x/net/http2"
 	"io"
 	"log"
 	"net/http"
@@ -19,6 +15,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+	"golang.org/x/net/http2"
 )
 
 const DefaultInstructModel = "gpt-3.5-turbo-instruct"
@@ -142,8 +143,11 @@ func getClient(cfg *config) (*http.Client, error) {
 func abortCodex(c *gin.Context, status int) {
 	c.Header("Content-Type", "text/event-stream")
 
-	c.String(status, "data: [DONE]\n")
+	c.String(status, `data: {"id":"chatcmpl-placeholder","object":"chat.completion.chunk","created":0,"model":"placeholder","system_fingerprint":"placeholder","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}],"usage":null}
+	data: [DONE]
+	`)
 	c.Abort()
+
 }
 
 func closeIO(c io.Closer) {
@@ -392,21 +396,48 @@ func (s *ProxyService) completions(c *gin.Context) {
 	}
 	defer closeIO(resp.Body)
 
-	if resp.StatusCode != http.StatusOK { // log
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		log.Println("request completions failed:", string(body))
-
-		resp.Body = io.NopCloser(bytes.NewBuffer(body))
+		c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
+		return
 	}
 
 	c.Status(resp.StatusCode)
-
-	contentType := resp.Header.Get("Content-Type")
-	if "" != contentType {
-		c.Header("Content-Type", contentType)
+	for k, v := range resp.Header {
+		c.Writer.Header()[k] = v
 	}
 
-	_, _ = io.Copy(c.Writer, resp.Body)
+	// 使用缓冲区来捕获响应
+	var buf bytes.Buffer
+	_, err = io.Copy(&buf, resp.Body)
+	if err != nil {
+		log.Println("Error reading response:", err)
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	// 将缓冲区内容转换为字符串
+	response := buf.String()
+
+	// 查找最后一个 "data:" 的位置
+	lastDataIndex := strings.LastIndex(response, "data:")
+
+	if lastDataIndex != -1 {
+		// 写入响应的前半部分
+		c.Writer.WriteString(response[:lastDataIndex])
+
+		// 插入自定义响应
+		c.Writer.WriteString("data: {\"id\":\"chatcmpl-custom\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"custom-model\",\"system_fingerprint\":\"custom-fingerprint\",\"choices\":[{\"index\":0,\"delta\":{},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":null}\n\n")
+
+		// 写入响应的后半部分
+		c.Writer.WriteString(response[lastDataIndex:])
+	} else {
+		// 如果没有找到 "data:"，就直接写入整个响应
+		c.Writer.WriteString(response)
+	}
+
+	c.Writer.Flush()
 }
 
 func (s *ProxyService) codeCompletions(c *gin.Context) {
